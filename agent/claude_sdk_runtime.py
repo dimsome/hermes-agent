@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -558,7 +558,7 @@ def run_claude_agent_sdk_turn(
             "agent_persisted": True,
         }
 
-    turn = None
+    turn = cast(Any, None)
     resumed = False
     send_text = user_message
     for attempt in (0, 1):
@@ -572,12 +572,13 @@ def run_claude_agent_sdk_turn(
                     send_text = digest + user_message
             _create_session(resume_id)
 
+        sdk_session = cast(Any, agent._claude_sdk_session)
         try:
-            turn = agent._claude_sdk_session.run_turn(user_input=send_text)
+            turn = sdk_session.run_turn(user_input=send_text)
         except Exception as exc:
             logger.exception("claude-agent-sdk turn failed")
             try:
-                agent._claude_sdk_session.close()
+                sdk_session.close()
             except Exception:
                 pass
             agent._claude_sdk_session = None
@@ -601,7 +602,7 @@ def run_claude_agent_sdk_turn(
                 "claude-agent-sdk session retired (turn error: %s)", turn.error
             )
             try:
-                agent._claude_sdk_session.close()
+                sdk_session.close()
             except Exception:
                 pass
             agent._claude_sdk_session = None

@@ -567,6 +567,7 @@ class ClaudeAgentSdkSession:
         """Bridge SDK permission requests onto Hermes' approval callback.
         Fail-closed: any callback failure denies."""
         approval_callback = self._approval_callback
+        assert approval_callback is not None
 
         async def _can_use_tool(tool_name: str, tool_input: dict, context: Any):
             from claude_agent_sdk import (
