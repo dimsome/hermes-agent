@@ -19,6 +19,8 @@ closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
 import types
+from typing import Any
+from unittest.mock import AsyncMock
 
 import yaml
 import pytest
@@ -201,3 +203,34 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_cache_miss_clears_sdk_continuity_when_switching_away(
+    tmp_path, monkeypatch
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "claude-opus-5", "provider": "claude-agent-sdk"},
+    )
+    runner = _make_runner(adapter)
+    backing_store = object()
+    runner_any: Any = runner
+    runner_any.session_store = backing_store
+    async_store = AsyncMock()
+    async_store._store = backing_store
+    async_store.get_or_create_session.return_value = types.SimpleNamespace(
+        session_id="sess-picker-sdk-out"
+    )
+    runner_any._async_session_store = async_store
+    runner._session_db = AsyncMock()
+    runner_any._evict_cached_agent = lambda session_key: None
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert confirmation is not None and "gpt-5.5" in confirmation
+    runner._session_db.update_claude_sdk_session_id.assert_awaited_once_with(
+        "sess-picker-sdk-out", None
+    )
