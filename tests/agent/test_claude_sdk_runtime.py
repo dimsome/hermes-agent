@@ -693,8 +693,9 @@ class TestHermesSessionIdPlumbing:
         assert captured.get("hermes_session_id") == "sess-1"
 
     def test_runtime_passes_context_to_append_builder(self, monkeypatch):
-        # W2: the append builder receives the agent's platform/session/model
-        # so the session line and platform hint reflect the live session.
+        # The append builder receives the agent's platform/session/model plus
+        # the resolved runtime cwd so native project context is loaded from the
+        # same workspace the SDK subprocess operates in.
         import agent.claude_sdk_runtime as rt
         import agent.transports.claude_agent_sdk_session as sdk_session_mod
 
@@ -716,6 +717,7 @@ class TestHermesSessionIdPlumbing:
         agent = _make_agent()
         agent._claude_sdk_session = None
         agent.platform = "telegram"
+        agent.session_cwd = "/tmp/sdk-runtime-workspace"
         run_claude_agent_sdk_turn(
             agent,
             user_message="hi",
@@ -727,6 +729,8 @@ class TestHermesSessionIdPlumbing:
             "platform": "telegram",
             "session_id": "sess-1",
             "model": "claude-opus-4-8",
+            "cwd": "/tmp/sdk-runtime-workspace",
+            "context_length": None,
         }
 
 
@@ -1360,6 +1364,92 @@ class TestSystemPromptAppend:
 
         assert out is not None
         assert out.startswith("# Active Hermes identity")
+
+    def test_cwd_agents_content_appears_after_single_active_soul(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        home = self._home(tmp_path, monkeypatch)
+        (home / "SOUL.md").write_text("# Active Hermes identity")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text(
+            "# Workspace contract\nUNIQUE_SDK_WORKSPACE_RULE"
+        )
+
+        out = build_system_prompt_append(cwd=str(workspace))
+
+        assert out is not None
+        assert out.startswith("# Active Hermes identity")
+        assert out.count("# Active Hermes identity") == 1
+        assert "## AGENTS.md" in out
+        assert "UNIQUE_SDK_WORKSPACE_RULE" in out
+        assert out.index("# Project Context") > out.index("# Active Hermes identity")
+
+    def test_native_context_builder_owns_priority_and_scanning(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.prompt_builder as prompt_builder
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch, soul="# SDK identity")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        captured = {}
+
+        def fake_context_builder(**kwargs):
+            captured.update(kwargs)
+            return "# Project Context\n\nNATIVE_PRIORITY_AND_SCAN_SENTINEL"
+
+        monkeypatch.setattr(
+            prompt_builder, "build_context_files_prompt", fake_context_builder
+        )
+
+        out = build_system_prompt_append(
+            cwd=str(workspace), context_length=123_456
+        )
+
+        assert captured == {
+            "cwd": str(workspace),
+            "skip_soul": True,
+            "context_length": 123_456,
+        }
+        assert "NATIVE_PRIORITY_AND_SCAN_SENTINEL" in (out or "")
+
+    def test_native_agents_priority_beats_lower_priority_claude_file(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch, soul="# SDK identity")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("AGENTS_PRIORITY_SENTINEL")
+        (workspace / "CLAUDE.md").write_text("CLAUDE_LOWER_PRIORITY_SENTINEL")
+
+        out = build_system_prompt_append(cwd=str(workspace)) or ""
+
+        assert "AGENTS_PRIORITY_SENTINEL" in out
+        assert "CLAUDE_LOWER_PRIORITY_SENTINEL" not in out
+
+    def test_normal_twenty_k_agents_block_fits_with_active_soul(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        home = self._home(tmp_path, monkeypatch)
+        (home / "SOUL.md").write_text("# Active identity\n" + ("s" * 7_500))
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agents_body = "# Workspace rules\n" + ("a" * 19_000) + "\nAGENTS_TAIL_SENTINEL"
+        (workspace / "AGENTS.md").write_text(agents_body)
+
+        out = build_system_prompt_append(cwd=str(workspace)) or ""
+
+        assert out.startswith("# Active identity")
+        assert "## AGENTS.md" in out
+        assert "AGENTS_TAIL_SENTINEL" in out
 
     def test_gauge_blocks_are_the_native_render(self, tmp_path, monkeypatch):
         # Byte-pin: the memory/user blocks are EXACTLY what the native

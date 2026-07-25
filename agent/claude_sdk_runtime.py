@@ -35,9 +35,9 @@ def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
 # Total append budget. Blocks are included whole, in priority order; a block
 # that does not fit is SKIPPED (never truncated mid-block) and later, smaller
 # blocks may still be included. Priority = assembly order below: soul,
-# session line, platform hint, user profile, memory, memory guidance,
-# session_search guidance, skills index.
-_APPEND_TOTAL_MAX_CHARS = 20000
+# native project context, session line, platform hint, user profile, memory,
+# memory guidance, session_search guidance, skills index.
+_APPEND_TOTAL_MAX_CHARS = 40000
 
 # Sentences that instruct the skill-WRITE tool — skill_manage is NOT exposed
 # through the MCP shims, and guidance must only describe callable tools.
@@ -87,6 +87,8 @@ def build_system_prompt_append(
     platform: Optional[str] = None,
     session_id: Optional[str] = None,
     model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    context_length: Optional[int] = None,
 ) -> Optional[str]:
     """Compose the system-prompt append for the SDK session.
 
@@ -95,16 +97,18 @@ def build_system_prompt_append(
 
       1. Hermes' active SOUL.md identity, or the built-in Hermes identity when
          no SOUL exists. agent.claude_agent_sdk.append_file can override it.
-      2. Session line — the native volatile-tier format (date-only for
+      2. Native project context (AGENTS.md / CLAUDE.md / .cursorrules) with
+         the native scanner, priority, safety checks, and budget.
+      3. Session line — the native volatile-tier format (date-only for
          prefix-cache stability) + session id / model / provider.
-      3. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
-      4. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
+      4. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
+      5. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
          verbatim, fill gauge included (the same store the memory MCP shim
          writes; config-gated on memory.memory_enabled).
-      5. MEMORY_GUIDANCE (minus its skill-tool sentence — skill_manage is
+      6. MEMORY_GUIDANCE (minus its skill-tool sentence — skill_manage is
          not exposed) + SESSION_SEARCH_GUIDANCE — the behavior contract for
          the two shim tools.
-      6. The skills index (build_skills_system_prompt) for the read-side
+      7. The skills index (build_skills_system_prompt) for the read-side
          skill_view/skills_list tools. SKILLS_GUIDANCE is deliberately
          ABSENT (it instructs skill_manage).
 
@@ -136,6 +140,22 @@ def build_system_prompt_append(
             logger.debug("native Hermes identity composition failed", exc_info=True)
     if identity:
         blocks.append(identity)
+
+    # Reuse Hermes' native project-context loader rather than maintaining a
+    # second scanner for this runtime. skip_soul=True prevents the active
+    # identity above from being injected a second time.
+    try:
+        from agent.prompt_builder import build_context_files_prompt
+
+        project_context = build_context_files_prompt(
+            cwd=cwd,
+            skip_soul=True,
+            context_length=context_length,
+        )
+        if project_context:
+            blocks.append(project_context)
+    except Exception:
+        logger.debug("native project context composition failed", exc_info=True)
 
     # Session line — mirrors the native composer's volatile tier
     # (system_prompt.py): date-only so the append stays byte-stable all day.
@@ -507,6 +527,10 @@ def run_claude_agent_sdk_turn(
             platform=getattr(agent, "platform", None),
             session_id=getattr(agent, "session_id", None),
             model=getattr(agent, "model", None),
+            cwd=cwd,
+            context_length=getattr(
+                getattr(agent, "context_compressor", None), "context_length", None
+            ),
         )
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
