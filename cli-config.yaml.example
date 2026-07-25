@@ -703,10 +703,18 @@ agent:
   #   # Optional operator persona/soul override. Empty loads the active
   #   # HERMES_HOME/SOUL.md, falling back to Hermes' built-in identity.
   #   append_file: ""
-  #   # Additional absolute directories granted alongside the SDK cwd.
-  #   # Paths are normalized/deduplicated and may be absent at session creation.
-  #   # Changes apply to new SDK sessions; no parent directory is inferred.
+  #   # add_dirs grants paths to Claude Code's native tools; it is not a
+  #   # read-only mount. Under default auto/acceptEdits, native edits and common
+  #   # filesystem mutations in added roots may be automatic. Removing Hermes
+  #   # MCP file/terminal tools does not remove Claude native tools. Therefore
+  #   # read-oriented headless profiles must use native_read_only: true and may
+  #   # additionally use HERMES_TERMINAL_SECURITY_MODE=approval-required.
+  #   # Paths are normalized/deduplicated; changes apply to new SDK sessions.
   #   add_dirs: []
+  #   # Native read-only disables user/project/local Claude settings for that SDK
+  #   # session, allows only Read, Glob, and Grep natively, and makes mutating
+  #   # native tools unavailable rather than interactively approvable.
+  #   native_read_only: false
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving

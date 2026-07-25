@@ -1179,10 +1179,19 @@ DEFAULT_CONFIG = {
             # Optional operator persona/soul file appended to the system prompt
             # ("" = none).
             "append_file": "",
-            # Additional absolute directories granted to the SDK alongside its
-            # cwd. Paths are normalized/deduplicated and need not exist when the
-            # SDK session is created. Empty preserves the SDK's default fence.
+            # `add_dirs` grants paths to Claude Code's native tools; it is not a
+            # read-only mount. Under default auto/acceptEdits, native edits and
+            # common filesystem mutations in added roots may be automatic.
+            # Removing Hermes MCP file/terminal tools does not remove Claude native
+            # tools. Therefore read-oriented headless profiles must use
+            # native_read_only: true and may additionally use
+            # HERMES_TERMINAL_SECURITY_MODE=approval-required.
+            # Paths are normalized/deduplicated; changes apply to new SDK sessions.
             "add_dirs": [],
+            # Native read-only disables user/project/local Claude settings for that
+            # SDK session, allows only Read, Glob, and Grep natively, and makes
+            # mutating native tools unavailable rather than interactively approvable.
+            "native_read_only": False,
         },
     },
 

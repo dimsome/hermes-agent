@@ -61,6 +61,12 @@ _HERMES_TO_SDK_PERMISSION_MODE = {
     "yolo": "bypassPermissions",
 }
 
+# ``ClaudeAgentOptions.tools`` is the pinned SDK's base native-tool surface;
+# MCP tools remain available through mcp_servers/allowed_tools. Keep the native
+# set exact and pair it with explicit mutator denies as defense in depth.
+_NATIVE_READ_ONLY_TOOLS = ("Read", "Glob", "Grep")
+_NATIVE_MUTATOR_DENIES = ("Write", "Edit", "Bash", "NotebookEdit")
+
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
 # contract: every needle is a phrase, never a bare token. Bare "401" matched
@@ -335,7 +341,12 @@ def _provider_config() -> dict:
         return {}
 
 
-def _provider_flag(config_key: str, default: bool = False) -> bool:
+def _provider_flag(
+    config_key: str,
+    default: bool = False,
+    *,
+    config: Optional[dict] = None,
+) -> bool:
     """Behavioural flag read from `agent.claude_agent_sdk.<key>` in config.yaml.
 
     config.yaml is the ONLY interface. AGENTS.md keeps non-secret behavioural
@@ -343,7 +354,9 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     no env override here — a deployment sets the key in config.yaml.
     Canonical defaults live in `hermes_cli/config.py::DEFAULT_CONFIG`.
     """
-    value = _provider_config().get(config_key, default)
+    value = (config if config is not None else _provider_config()).get(
+        config_key, default
+    )
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes")
     return bool(value)
@@ -425,6 +438,7 @@ class ClaudeAgentSdkSession:
         *,
         cwd: Optional[str] = None,
         add_dirs: Optional[list[str]] = None,
+        native_read_only: bool = False,
         model: Optional[str] = None,
         permission_mode: Optional[str] = None,
         system_prompt_append: Optional[str] = None,
@@ -439,6 +453,7 @@ class ClaudeAgentSdkSession:
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._add_dirs = _normalize_add_dirs([] if add_dirs is None else add_dirs)
+        self._native_read_only = bool(native_read_only)
         self._model = model
         self._permission_mode = (
             permission_mode
@@ -758,6 +773,17 @@ class ClaudeAgentSdkSession:
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
         }
+        if self._native_read_only:
+            # This boundary does not depend on can_use_tool: mutators are absent
+            # from the native surface and explicitly denied. An empty source list
+            # blocks user/project/local settings from widening permissions/roots.
+            fields.update(
+                {
+                    "tools": list(_NATIVE_READ_ONLY_TOOLS),
+                    "disallowed_tools": list(_NATIVE_MUTATOR_DENIES),
+                    "setting_sources": [],
+                }
+            )
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
         if self._add_dirs:

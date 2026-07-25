@@ -11,6 +11,7 @@ retire the client rather than silently continue.
 """
 
 from dataclasses import dataclass, field
+import json
 import os
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -423,6 +424,12 @@ class TestSession:
             "acceptEdits", "default", "bypassPermissions",
         }
         assert "add_dirs" not in options
+        for predecessor_absent_field in (
+            "tools",
+            "disallowed_tools",
+            "setting_sources",
+        ):
+            assert predecessor_absent_field not in options
 
     def test_approval_required_keeps_default_mode_and_callback(self, monkeypatch):
         monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
@@ -445,6 +452,188 @@ class TestSession:
 
         assert fields["permission_mode"] == "acceptEdits"
         assert fields["can_use_tool"] is None
+
+
+    _READ_ONLY_NATIVE_TOOLS = ["Read", "Glob", "Grep"]
+    _NATIVE_MUTATOR_DENIES = ["Write", "Edit", "Bash", "NotebookEdit"]
+    _FORBIDDEN_HERMES_TOOLS = (
+        "read_file",
+        "search_files",
+        "terminal",
+        "write_file",
+        "patch",
+    )
+
+    @staticmethod
+    def _pinned_command(session):
+        pytest.importorskip("claude_agent_sdk")
+        client = session._build_client()
+        transport = client._custom_transport
+        transport._cli_path = transport._find_bundled_cli()
+        return client.options, transport._build_command()
+
+    def test_explicit_false_preserves_predecessor_option_and_command_shape(self):
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            native_read_only=False,
+            include_hermes_tools=False,
+        )
+
+        fields = session.build_option_fields()
+        for predecessor_absent_field in (
+            "tools",
+            "disallowed_tools",
+            "setting_sources",
+        ):
+            assert predecessor_absent_field not in fields
+
+        _options, command = self._pinned_command(session)
+        assert "--tools" not in command
+        assert "--disallowedTools" not in command
+        assert not any(arg.startswith("--setting-sources") for arg in command)
+
+    def test_true_materializes_exact_native_and_curated_mcp_fields(self):
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp/sdk-native-read-only",
+            native_read_only=True,
+            system_prompt_append="HERMES_CONTEXT_SENTINEL",
+        )
+
+        fields = session.build_option_fields()
+        expected_mcp_tools = [
+            *(f"mcp__hermes-tools__{name}" for name in EXPOSED_TOOLS),
+            "mcp__hermes-tools__memory",
+            "mcp__hermes-tools__session_search",
+        ]
+        assert fields["tools"] == self._READ_ONLY_NATIVE_TOOLS
+        assert fields["disallowed_tools"] == self._NATIVE_MUTATOR_DENIES
+        assert fields["setting_sources"] == []
+        assert fields["allowed_tools"] == expected_mcp_tools
+        assert set(fields["mcp_servers"]) == {"hermes-tools"}
+        assert fields["system_prompt"] == {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": "HERMES_CONTEXT_SENTINEL",
+        }
+        for forbidden in self._FORBIDDEN_HERMES_TOOLS:
+            assert f"mcp__hermes-tools__{forbidden}" not in fields["allowed_tools"]
+
+    def test_headless_approval_required_denies_mutation_by_tool_absence(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            native_read_only=True,
+            approval_callback=None,
+            include_hermes_tools=False,
+        ).build_option_fields()
+
+        assert fields["permission_mode"] == "default"
+        assert fields["can_use_tool"] is None
+        assert fields["tools"] == self._READ_ONLY_NATIVE_TOOLS
+        assert all(tool not in fields["tools"] for tool in self._NATIVE_MUTATOR_DENIES)
+        assert fields["disallowed_tools"] == self._NATIVE_MUTATOR_DENIES
+
+    def test_true_spawn_command_ignores_filesystem_settings_and_keeps_two_roots(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        import anyio
+        pytest.importorskip("claude_agent_sdk")
+
+        home = tmp_path / "home"
+        user_settings = home / ".claude"
+        project = tmp_path / "project"
+        project_settings = project / ".claude"
+        user_settings.mkdir(parents=True)
+        project_settings.mkdir(parents=True)
+        settings_root = tmp_path / "settings-added-root"
+        hostile_settings = {
+            "permissions": {
+                "allow": ["Write(*)", "Bash(*)"],
+                "additionalDirectories": [str(settings_root)],
+            }
+        }
+        payload = json.dumps(hostile_settings)
+        (user_settings / "settings.json").write_text(payload)
+        (project_settings / "settings.json").write_text(payload)
+        (project_settings / "settings.local.json").write_text(payload)
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user_settings))
+        monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+
+        process_calls = []
+
+        class _FakeProcess:
+            stdin = None
+            stdout = None
+            stderr = None
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        async def _fake_open_process(command, **kwargs):
+            process_calls.append((list(command), kwargs))
+            return _FakeProcess()
+
+        monkeypatch.setattr(anyio, "open_process", _fake_open_process)
+        roots = [tmp_path / "read-root-a", tmp_path / "read-root-b"]
+        configured_roots = [
+            tmp_path / "nested" / ".." / roots[0].name,
+            roots[1] / ".",
+        ]
+        session = ClaudeAgentSdkSession(
+            cwd=str(project),
+            add_dirs=[str(root) for root in configured_roots],
+            native_read_only=True,
+            system_prompt_append="HERMES_CONTEXT_SENTINEL",
+        )
+        client = session._build_client()
+        transport = client._custom_transport
+
+        async def _spawn_and_close():
+            await transport.connect()
+            await transport.close()
+
+        asyncio.run(_spawn_and_close())
+
+        assert len(process_calls) == 1
+        command, spawn_kwargs = process_calls[0]
+        assert command[command.index("--tools") + 1] == ",".join(
+            self._READ_ONLY_NATIVE_TOOLS
+        )
+        assert command[command.index("--disallowedTools") + 1] == ",".join(
+            self._NATIVE_MUTATOR_DENIES
+        )
+        assert "--setting-sources=" in command
+        assert "--settings" not in command
+        add_dir_values = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--add-dir"
+        ]
+        assert add_dir_values == [str(root) for root in roots]
+        assert str(settings_root) not in command
+
+        allowed = command[command.index("--allowedTools") + 1].split(",")
+        assert "mcp__hermes-tools__skills_list" in allowed
+        assert "mcp__hermes-tools__memory" in allowed
+        for forbidden in self._FORBIDDEN_HERMES_TOOLS:
+            assert f"mcp__hermes-tools__{forbidden}" not in allowed
+        mcp_config = json.loads(command[command.index("--mcp-config") + 1])
+        assert set(mcp_config["mcpServers"]) == {"hermes-tools"}
+
+        assert client.options.setting_sources == []
+        assert client.options.system_prompt["append"] == "HERMES_CONTEXT_SENTINEL"
+        assert client.options.env["HOME"] == str(home)
+        assert client.options.env["CLAUDE_CONFIG_DIR"] == str(user_settings)
+        assert spawn_kwargs["cwd"] == str(project)
 
     def test_metered_key_scrubbed_from_mcp_env(self, monkeypatch):
         # RED-first: with the ambient var set, the builder must scrub it.
@@ -567,6 +756,7 @@ class TestClaudeAgentSdkAdditionalDirectories:
         self._run_new_session(agent)
 
         assert instances[0].kwargs["add_dirs"] == []
+        assert instances[0].kwargs["native_read_only"] is False
         fields = ClaudeAgentSdkSession(
             cwd="/tmp",
             add_dirs=instances[0].kwargs["add_dirs"],
@@ -649,7 +839,10 @@ class TestClaudeAgentSdkAdditionalDirectories:
         assert "credential-sentinel" not in str(exc.value)
 
     def test_profile_config_is_snapshotted_per_session(self, monkeypatch):
-        config = {"add_dirs": ["/srv/hermes/first"]}
+        config = {
+            "add_dirs": ["/srv/hermes/first"],
+            "native_read_only": True,
+        }
         import hermes_cli.config as cfg
 
         monkeypatch.setattr(
@@ -665,14 +858,17 @@ class TestClaudeAgentSdkAdditionalDirectories:
 
         self._run_new_session(agent)
         config["add_dirs"] = ["/srv/hermes/second"]
+        config["native_read_only"] = False
         self._run_new_session(agent)
 
         assert len(instances) == 1
         assert instances[0].kwargs["add_dirs"] == ["/srv/hermes/first"]
+        assert instances[0].kwargs["native_read_only"] is True
 
         agent._claude_sdk_session = None
         self._run_new_session(agent)
         assert instances[1].kwargs["add_dirs"] == ["/srv/hermes/second"]
+        assert instances[1].kwargs["native_read_only"] is False
 
 
 class TestRuntimeGlue:

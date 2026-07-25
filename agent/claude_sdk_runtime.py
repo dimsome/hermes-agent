@@ -507,12 +507,17 @@ def run_claude_agent_sdk_turn(
         ClaudeAgentSdkSession,
         _normalize_add_dirs,
         _provider_config,
+        _provider_flag,
     )
 
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
-        add_dirs = _normalize_add_dirs(_provider_config().get("add_dirs", []))
+        provider_config = _provider_config()
+        add_dirs = _normalize_add_dirs(provider_config.get("add_dirs", []))
+        native_read_only = _provider_flag(
+            "native_read_only", config=provider_config
+        )
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         try:
             from tools.terminal_tool import _get_approval_callback
@@ -554,6 +559,7 @@ def run_claude_agent_sdk_turn(
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             add_dirs=add_dirs,
+            native_read_only=native_read_only,
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,
