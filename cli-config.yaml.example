@@ -703,6 +703,10 @@ agent:
   #   # Optional operator persona/soul override. Empty loads the active
   #   # HERMES_HOME/SOUL.md, falling back to Hermes' built-in identity.
   #   append_file: ""
+  #   # Additional absolute directories granted alongside the SDK cwd.
+  #   # Paths are normalized/deduplicated and may be absent at session creation.
+  #   # Changes apply to new SDK sessions; no parent directory is inferred.
+  #   add_dirs: []
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving

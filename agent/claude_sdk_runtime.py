@@ -503,11 +503,16 @@ def run_claude_agent_sdk_turn(
       error/timeout retire      → id CLEARED → next turn fresh + digest
       stale/failed resume       → retire → clear → ONE fresh retry with digest
     """
-    from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
+    from agent.transports.claude_agent_sdk_session import (
+        ClaudeAgentSdkSession,
+        _normalize_add_dirs,
+        _provider_config,
+    )
 
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
+        add_dirs = _normalize_add_dirs(_provider_config().get("add_dirs", []))
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         try:
             from tools.terminal_tool import _get_approval_callback
@@ -548,6 +553,7 @@ def run_claude_agent_sdk_turn(
         )
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
+            add_dirs=add_dirs,
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,

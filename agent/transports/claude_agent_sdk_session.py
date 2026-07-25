@@ -349,6 +349,42 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def _normalize_add_dirs(value: Any) -> list[str]:
+    """Validate and snapshot ``agent.claude_agent_sdk.add_dirs``.
+
+    Existence is deliberately not required: the SDK accepts paths that may be
+    mounted or created later. Validation is lexical and deterministic at SDK
+    session creation, before any child or client is constructed.
+    """
+    config_key = "agent.claude_agent_sdk.add_dirs"
+    if not isinstance(value, list):
+        raise ValueError(f"{config_key} must be a list")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"{config_key} entries must be non-empty absolute paths "
+                f"(invalid entry at index {index})"
+            )
+        if (
+            not entry
+            or entry != entry.strip()
+            or not os.path.isabs(entry)
+            or "\x00" in entry
+        ):
+            raise ValueError(
+                f"{config_key} entries must be non-empty absolute paths "
+                f"(invalid entry at index {index})"
+            )
+        path = os.path.normpath(entry)
+        if path not in seen:
+            seen.add(path)
+            normalized.append(path)
+    return normalized
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -388,6 +424,7 @@ class ClaudeAgentSdkSession:
         self,
         *,
         cwd: Optional[str] = None,
+        add_dirs: Optional[list[str]] = None,
         model: Optional[str] = None,
         permission_mode: Optional[str] = None,
         system_prompt_append: Optional[str] = None,
@@ -401,6 +438,7 @@ class ClaudeAgentSdkSession:
         on_stream_delta: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        self._add_dirs = _normalize_add_dirs([] if add_dirs is None else add_dirs)
         self._model = model
         self._permission_mode = (
             permission_mode
@@ -722,6 +760,8 @@ class ClaudeAgentSdkSession:
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
+        if self._add_dirs:
+            fields["add_dirs"] = list(self._add_dirs)
         # Default OFF (upstream-conservative): partial messages only when the
         # operator opts in via agent.claude_agent_sdk.streaming in config.yaml.
         if _provider_flag("streaming"):

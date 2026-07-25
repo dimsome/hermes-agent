@@ -10,6 +10,8 @@ Adapted from upstream PR #65982 commit 10659717722effd9bb7738423a2399770f50a428.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from hermes_cli.config import DEFAULT_CONFIG
 
 
@@ -21,11 +23,17 @@ class TestClaudeAgentSdkDefaults:
 
     def test_canonical_defaults(self):
         # Subscription-only is invariant runtime behavior, not a configurable
-        # escape hatch. Only streaming and the persona append are configurable.
+        # escape hatch. Additional directory access is opt-in and empty by
+        # default.
         assert DEFAULT_CONFIG["agent"]["claude_agent_sdk"] == {
             "streaming": False,
             "append_file": "",
+            "add_dirs": [],
         }
+
+    def test_example_documents_empty_additional_directories(self):
+        example = Path(__file__).resolve().parents[2] / "cli-config.yaml.example"
+        assert "add_dirs: []" in example.read_text()
 
 
 class TestUserConfigMerge:
@@ -51,6 +59,7 @@ class TestUserConfigMerge:
         assert cfg["agent"]["claude_agent_sdk"] == {
             "streaming": False,
             "append_file": "",
+            "add_dirs": [],
         }
         assert cfg["agent"]["max_turns"] == 5
 
@@ -63,3 +72,4 @@ class TestUserConfigMerge:
         assert cfg["agent"]["claude_agent_sdk"]["streaming"] is True
         assert "allow_metered_key" not in cfg["agent"]["claude_agent_sdk"]
         assert cfg["agent"]["claude_agent_sdk"]["append_file"] == ""
+        assert cfg["agent"]["claude_agent_sdk"]["add_dirs"] == []

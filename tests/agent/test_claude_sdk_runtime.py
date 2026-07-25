@@ -413,11 +413,38 @@ class TestSession:
         assert mcp["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
         assert "mcp__hermes-tools__skills_list" in options["allowed_tools"]
         assert "mcp__hermes-tools__memory" in options["allowed_tools"]
+        for forbidden in (
+            "read_file", "search_files", "terminal", "write_file", "patch"
+        ):
+            assert f"mcp__hermes-tools__{forbidden}" not in options["allowed_tools"]
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
         assert options["permission_mode"] in {
             "acceptEdits", "default", "bypassPermissions",
         }
+        assert "add_dirs" not in options
+
+    def test_approval_required_keeps_default_mode_and_callback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=lambda *args, **kwargs: "once",
+            include_hermes_tools=False,
+        ).build_option_fields()
+
+        assert fields["permission_mode"] == "default"
+        assert callable(fields["can_use_tool"])
+
+    def test_auto_keeps_accept_edits_without_permission_callback(self, monkeypatch):
+        monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=lambda *args, **kwargs: "once",
+            include_hermes_tools=False,
+        ).build_option_fields()
+
+        assert fields["permission_mode"] == "acceptEdits"
+        assert fields["can_use_tool"] is None
 
     def test_metered_key_scrubbed_from_mcp_env(self, monkeypatch):
         # RED-first: with the ambient var set, the builder must scrub it.
@@ -490,6 +517,162 @@ def _make_agent():
     agent.provider = "claude-agent-sdk"
     agent.base_url = ""
     return agent
+
+
+class TestClaudeAgentSdkAdditionalDirectories:
+    @staticmethod
+    def _set_config(monkeypatch, add_dirs):
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *args, **kwargs: {
+                "agent": {"claude_agent_sdk": {"add_dirs": add_dirs}}
+            },
+        )
+
+    @staticmethod
+    def _capture_sessions(monkeypatch):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        instances = []
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                instances.append(self)
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        return instances
+
+    @staticmethod
+    def _run_new_session(agent):
+        return run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+    def test_default_does_not_add_an_sdk_option(self, monkeypatch):
+        instances = self._capture_sessions(monkeypatch)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+
+        self._run_new_session(agent)
+
+        assert instances[0].kwargs["add_dirs"] == []
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            add_dirs=instances[0].kwargs["add_dirs"],
+            include_hermes_tools=False,
+        ).build_option_fields()
+        assert "add_dirs" not in fields
+
+    def test_two_configured_missing_roots_reach_sdk_options_once_each(
+        self, tmp_path, monkeypatch
+    ):
+        roots = [tmp_path / "missing-a", tmp_path / "missing-b"]
+        assert all(not root.exists() for root in roots)
+        self._set_config(monkeypatch, [str(root) for root in roots])
+        instances = self._capture_sessions(monkeypatch)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+
+        self._run_new_session(agent)
+
+        expected = [str(root) for root in roots]
+        assert instances[0].kwargs["add_dirs"] == expected
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            add_dirs=instances[0].kwargs["add_dirs"],
+            include_hermes_tools=False,
+        ).build_option_fields()
+        assert fields["add_dirs"] == expected
+
+    def test_normalizes_and_deduplicates_without_collapsing_child_roots(
+        self, monkeypatch
+    ):
+        self._set_config(
+            monkeypatch,
+            [
+                "/srv/hermes/teams/../team",
+                "/srv/hermes/team/",
+                "/srv/hermes/team/project",
+                "/srv/hermes/team/project/.",
+            ],
+        )
+        instances = self._capture_sessions(monkeypatch)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+
+        self._run_new_session(agent)
+
+        assert instances[0].kwargs["add_dirs"] == [
+            "/srv/hermes/team",
+            "/srv/hermes/team/project",
+        ]
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            "credential-sentinel-not-a-list",
+            [42],
+            [""],
+            ["   "],
+            ["relative/credential-sentinel"],
+            [" /root/credential-sentinel "],
+        ],
+    )
+    def test_invalid_config_fails_before_session_construction(
+        self, monkeypatch, invalid
+    ):
+        import agent.claude_sdk_runtime as runtime
+
+        self._set_config(monkeypatch, invalid)
+        instances = self._capture_sessions(monkeypatch)
+        monkeypatch.setattr(
+            runtime, "build_system_prompt_append", lambda **kwargs: None
+        )
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+
+        with pytest.raises(ValueError, match=r"agent\.claude_agent_sdk\.add_dirs") as exc:
+            self._run_new_session(agent)
+
+        assert instances == []
+        assert "credential-sentinel" not in str(exc.value)
+
+    def test_profile_config_is_snapshotted_per_session(self, monkeypatch):
+        config = {"add_dirs": ["/srv/hermes/first"]}
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *args, **kwargs: {
+                "agent": {"claude_agent_sdk": dict(config)}
+            },
+        )
+        instances = self._capture_sessions(monkeypatch)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+
+        self._run_new_session(agent)
+        config["add_dirs"] = ["/srv/hermes/second"]
+        self._run_new_session(agent)
+
+        assert len(instances) == 1
+        assert instances[0].kwargs["add_dirs"] == ["/srv/hermes/first"]
+
+        agent._claude_sdk_session = None
+        self._run_new_session(agent)
+        assert instances[1].kwargs["add_dirs"] == ["/srv/hermes/second"]
 
 
 class TestRuntimeGlue:

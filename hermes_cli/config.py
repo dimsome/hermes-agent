@@ -1179,6 +1179,10 @@ DEFAULT_CONFIG = {
             # Optional operator persona/soul file appended to the system prompt
             # ("" = none).
             "append_file": "",
+            # Additional absolute directories granted to the SDK alongside its
+            # cwd. Paths are normalized/deduplicated and need not exist when the
+            # SDK session is created. Empty preserves the SDK's default fence.
+            "add_dirs": [],
         },
     },
 
