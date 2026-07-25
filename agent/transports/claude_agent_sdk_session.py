@@ -209,6 +209,83 @@ def _build_sanitized_cli_env() -> dict[str, str]:
     }
 
 
+async def _empty_sdk_prompt_stream():
+    """Match the empty streaming prompt used by ``ClaudeSDKClient.connect(None)``."""
+    return
+    yield {}  # pragma: no cover - makes this an async generator
+
+
+def _build_sanitized_sdk_transport(options: Any) -> Any:
+    """Build the pinned SDK subprocess transport with a sanitized version probe.
+
+    ``claude-agent-sdk==0.2.120`` applies ``options.env`` to the long-lived CLI
+    child but omits ``env=`` from its preceding ``claude -v`` process. The SDK's
+    supported custom-Transport seam lets us repair only that preflight while
+    inheriting its command construction, streaming, stderr, and cleanup logic.
+    """
+    import re
+    from contextlib import suppress
+    from subprocess import PIPE
+
+    import anyio
+    from claude_agent_sdk._errors import CLINotFoundError
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        MINIMUM_CLAUDE_CODE_VERSION,
+        SubprocessCLITransport,
+    )
+
+    class _SanitizedSubprocessCLITransport(SubprocessCLITransport):
+        async def _check_claude_version(self) -> None:
+            """Preserve the SDK check while giving its child the sanitized env."""
+            if self._cli_path is None:
+                raise CLINotFoundError("CLI path not resolved. Call connect() first.")
+            version_process = None
+            try:
+                with anyio.fail_after(2):
+                    version_process = await anyio.open_process(
+                        [self._cli_path, "-v"],
+                        stdout=PIPE,
+                        stderr=PIPE,
+                        env=dict(self._options.env or {}),
+                    )
+
+                    if version_process.stdout:
+                        stdout_bytes = await version_process.stdout.receive()
+                        version_output = stdout_bytes.decode().strip()
+
+                        match = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", version_output)
+                        if match:
+                            version = match.group(1)
+                            version_parts = [int(x) for x in version.split(".")]
+                            min_parts = [
+                                int(x)
+                                for x in MINIMUM_CLAUDE_CODE_VERSION.split(".")
+                            ]
+
+                            if version_parts < min_parts:
+                                logger.warning(
+                                    "Claude Code version %s at %s is unsupported in the "
+                                    "Agent SDK. Minimum required version is %s. Some "
+                                    "features may not work correctly.",
+                                    version,
+                                    self._cli_path,
+                                    MINIMUM_CLAUDE_CODE_VERSION,
+                                )
+            except Exception:
+                pass
+            finally:
+                if version_process:
+                    with suppress(Exception):
+                        version_process.terminate()
+                    with suppress(Exception):
+                        await version_process.wait()
+
+    return _SanitizedSubprocessCLITransport(
+        prompt=_empty_sdk_prompt_stream(),
+        options=options,
+    )
+
+
 # Any one of these non-empty variables can select or authenticate a metered
 # Claude backend. This runtime is subscription-only, so reject the route before
 # the SDK creates its inherited-environment CLI subprocess. The cloud-provider
@@ -655,9 +732,21 @@ class ClaudeAgentSdkSession:
         fields = self.build_option_fields()
         if self._client_factory is not None:
             return self._client_factory(options=fields)
+        from dataclasses import replace
+
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-        return ClaudeSDKClient(options=ClaudeAgentOptions(**fields))
+        options = ClaudeAgentOptions(**fields)
+        # The SDK normally adds this field to the transport's option copy when
+        # can_use_tool is active. A pre-constructed custom transport does not
+        # receive that copy, so preserve the approval control-protocol flag here.
+        transport_options = (
+            replace(options, permission_prompt_tool_name="stdio")
+            if options.can_use_tool
+            else options
+        )
+        transport = _build_sanitized_sdk_transport(transport_options)
+        return ClaudeSDKClient(options=options, transport=transport)
 
     def _make_can_use_tool(self) -> Any:
         """Bridge SDK permission requests onto Hermes' approval callback.

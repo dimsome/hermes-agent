@@ -578,6 +578,64 @@ class TestRuntimeGlue:
         assert flushed_messages == result["messages"]
         assert flushed_messages[-1]["effect_disposition"] == "unknown"
 
+    def test_interrupted_partial_mixed_batch_is_balanced_before_flush(self):
+        agent = _make_agent()
+        agent._session_db = MagicMock()
+        agent._flush_messages_to_session_db = MagicMock()
+        assistant_batch = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu-answered-read",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "/x"}'},
+                },
+                {
+                    "id": "toolu-missing-bash",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": '{"command": "touch /tmp/maybe-ran"}',
+                    },
+                },
+            ],
+        }
+        answered_read = {
+            "role": "tool",
+            "tool_call_id": "toolu-answered-read",
+            "content": "existing contents",
+        }
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            interrupted=True,
+            projected_messages=[assistant_batch, answered_read],
+            final_text="",
+        )
+        messages = [{"role": "user", "content": "read then run"}]
+
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="read then run",
+            original_user_message="read then run",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        projected = result["messages"][1:]
+        assert projected[:2] == [assistant_batch, answered_read]
+        results = [message for message in projected if message.get("role") == "tool"]
+        assert [message["tool_call_id"] for message in results] == [
+            "toolu-answered-read",
+            "toolu-missing-bash",
+        ]
+        assert results[0] == answered_read
+        assert results[1]["effect_disposition"] == "unknown"
+        assert "unknown" in results[1]["content"].lower()
+        call_ids = {call["id"] for call in assistant_batch["tool_calls"]}
+        assert {message["tool_call_id"] for message in results} == call_ids
+        flushed_messages = agent._flush_messages_to_session_db.call_args.args[0]
+        assert flushed_messages == result["messages"]
+
 
 # ---------- background review must not spawn on this runtime ----------
 
@@ -661,6 +719,144 @@ class TestMcpEnvMinimal:
         assert all(option_env[name] == "" for name in blocked)
         assert sentinel not in option_env.values()
         assert {name: option_env[name] for name in allowed} == allowed
+
+    def test_sdk_client_uses_custom_subprocess_transport_with_empty_prompt(self):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            permission_mode="default",
+            approval_callback=lambda *args, **kwargs: "once",
+            include_hermes_tools=False,
+        )
+        client = session._build_client()
+        transport = client._custom_transport
+
+        assert isinstance(transport, SubprocessCLITransport)
+        assert type(transport) is not SubprocessCLITransport
+        assert transport._options.env == client.options.env
+        assert client.options.permission_prompt_tool_name is None
+        assert transport._options.permission_prompt_tool_name == "stdio"
+        assert transport._options.can_use_tool is client.options.can_use_tool
+
+        async def _collect_prompt():
+            return [message async for message in transport._prompt]
+
+        assert asyncio.run(_collect_prompt()) == []
+
+    def test_version_preflight_and_streaming_cli_receive_sanitized_env(
+        self, monkeypatch, caplog
+    ):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        import claude_agent_sdk._internal.transport.subprocess_cli as subprocess_cli
+
+        sentinel = "SDK_PROCESS_ENV_SENTINEL"
+        blocked = (
+            "SDK_ARBITRARY_SECRET",
+            "OPENROUTER_API_KEY",
+            "TELEGRAM_BOT_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+        )
+        for name in blocked:
+            monkeypatch.setenv(name, sentinel)
+        monkeypatch.setenv("HOME", "/tmp/sdk-home")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+
+        class _FakeStream:
+            def __init__(self, payload=b""):
+                self._payload = payload
+
+            async def receive(self, max_bytes=65536):
+                payload, self._payload = self._payload, b""
+                return payload
+
+            async def aclose(self):
+                return None
+
+        class _FakeProcess:
+            def __init__(self, *, version_probe):
+                self.stdin = None
+                self.stdout = _FakeStream(b"1.9.9\n" if version_probe else b"")
+                self.stderr = None
+                self.returncode = None
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        process_calls = []
+
+        async def _fake_open_process(argv, **kwargs):
+            process_calls.append((list(argv), kwargs))
+            return _FakeProcess(version_probe=argv[-1] == "-v")
+
+        monkeypatch.setattr(subprocess_cli.anyio, "open_process", _fake_open_process)
+        session = ClaudeAgentSdkSession(cwd="/tmp", include_hermes_tools=False)
+        client = session._build_client()
+        transport = client._custom_transport
+        transport._cli_path = "/fake/claude"
+
+        async def _connect_and_close():
+            await transport.connect()
+            await transport.close()
+
+        asyncio.run(_connect_and_close())
+
+        assert len(process_calls) == 2
+        version_call = next(call for call in process_calls if call[0][-1] == "-v")
+        streaming_call = next(call for call in process_calls if call[0][-1] != "-v")
+        for argv, kwargs in (version_call, streaming_call):
+            assert kwargs.get("env") is not None, f"missing explicit env for {argv}"
+            child_env = kwargs["env"]
+            assert child_env["HOME"] == "/tmp/sdk-home"
+            assert child_env["PATH"] == "/usr/local/bin:/usr/bin"
+            assert all(child_env[name] == "" for name in blocked)
+            assert sentinel not in child_env.values()
+        assert "Minimum required version is 2.0.0" in caplog.text
+
+    def test_session_module_import_stays_lazy_without_optional_sdk(self):
+        import subprocess
+        import sys
+        import textwrap
+        from pathlib import Path
+
+        script = textwrap.dedent(
+            """
+            import builtins
+            original_import = builtins.__import__
+
+            def blocked_import(name, *args, **kwargs):
+                if name == "claude_agent_sdk" or name.startswith("claude_agent_sdk."):
+                    raise ImportError("optional SDK blocked by test")
+                return original_import(name, *args, **kwargs)
+
+            builtins.__import__ = blocked_import
+            import agent.transports.claude_agent_sdk_session
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
 
     def test_mcp_env_carries_no_secrets(self, monkeypatch):
         # Validator C4 (HIGH): the SDK inlines the MCP config -- env
