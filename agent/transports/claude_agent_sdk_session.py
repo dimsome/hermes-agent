@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 # TurnResult is the shared contract with the runtime glue — reused verbatim
@@ -37,6 +38,13 @@ from agent.transports.codex_app_server_session import TurnResult
 from agent.transports.claude_sdk_event_projector import ClaudeSdkEventProjector
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ClaudeTurnResult(TurnResult):
+    """Turn result with the model identifier reported by the SDK stream."""
+
+    response_model: Optional[str] = None
 
 
 # HERMES_TERMINAL_SECURITY_MODE → SDK permission_mode. A deploy-side env
@@ -336,10 +344,10 @@ class ClaudeAgentSdkSession:
         user_input: Any,
         *,
         turn_timeout: float = 600.0,
-    ) -> TurnResult:
+    ) -> ClaudeTurnResult:
         """Send a user message and block until the SDK's ResultMessage,
         projecting the typed stream into Hermes' messages shape."""
-        result = TurnResult()
+        result = ClaudeTurnResult()
         try:
             self.ensure_started()
         except Exception as exc:
@@ -380,6 +388,7 @@ class ClaudeAgentSdkSession:
         result.token_usage_total = turn_data["usage"]
         result.thread_id = self._session_id
         result.turn_id = turn_data.get("result_uuid")
+        result.response_model = turn_data.get("model")
         result.interrupted = self._interrupt_event.is_set()
         if result.interrupted:
             # Consume the honored interrupt so it cannot bleed into the
@@ -404,6 +413,7 @@ class ClaudeAgentSdkSession:
             "usage": None,
             "error": None,
             "result_uuid": None,
+            "model": None,
         }
         await self._client.query(text)
         async for message in self._client.receive_response():
@@ -418,6 +428,10 @@ class ClaudeAgentSdkSession:
             if type(message).__name__ == "StreamEvent":
                 self._forward_stream_delta(message)
                 continue
+            if type(message).__name__ == "AssistantMessage":
+                response_model = getattr(message, "model", None)
+                if isinstance(response_model, str) and response_model:
+                    out["model"] = response_model
             self._notify_tool_started(message)
             projection = projector.project(message)
             if projection.messages:
@@ -492,10 +506,21 @@ class ClaudeAgentSdkSession:
         """The ClaudeAgentOptions field dict — plain data so tests can assert
         on it without importing the SDK."""
         mcp_servers: dict[str, Any] = {}
+        allowed_tools: list[str] = []
         if self._include_hermes_tools:
+            from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id
             )
+            # Hermes registry tools enforce their own safety contracts. Approve
+            # this curated namespace so a headless gateway turn does not receive
+            # an SDK permission prompt that it has no interactive channel to answer.
+            allowed_tools = [
+                *(f"mcp__hermes-tools__{name}" for name in EXPOSED_TOOLS),
+                "mcp__hermes-tools__memory",
+                "mcp__hermes-tools__session_search",
+            ]
 
         system_prompt: Any = {"type": "preset", "preset": "claude_code"}
         if self._system_prompt_append:
@@ -518,6 +543,7 @@ class ClaudeAgentSdkSession:
             "permission_mode": self._permission_mode,
             "system_prompt": system_prompt,
             "mcp_servers": mcp_servers,
+            "allowed_tools": allowed_tools,
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
         }

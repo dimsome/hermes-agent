@@ -323,6 +323,7 @@ class TestSession:
         assert turn.tool_iterations == 1
         assert turn.token_usage_last == {"input_tokens": 10, "output_tokens": 5}
         assert turn.thread_id == "sdk-session-1"
+        assert turn.response_model == "claude-opus-4-8"
         # assistant(tool_call) + tool + assistant(text)
         assert [m["role"] for m in turn.projected_messages] == [
             "assistant", "tool", "assistant",
@@ -377,6 +378,8 @@ class TestSession:
         assert "hermes-tools" in options["mcp_servers"]
         mcp = options["mcp_servers"]["hermes-tools"]
         assert mcp["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
+        assert "mcp__hermes-tools__skills_list" in options["allowed_tools"]
+        assert "mcp__hermes-tools__memory" in options["allowed_tools"]
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
         assert options["permission_mode"] in {
@@ -1346,6 +1349,17 @@ class TestSystemPromptAppend:
         assert out is not None
         assert out.startswith("# I am the persona under test")
         assert "The user prefers concise results" in out
+
+    def test_active_hermes_soul_is_default_identity(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        home = self._home(tmp_path, monkeypatch)
+        (home / "SOUL.md").write_text("# Active Hermes identity")
+
+        out = build_system_prompt_append()
+
+        assert out is not None
+        assert out.startswith("# Active Hermes identity")
 
     def test_gauge_blocks_are_the_native_render(self, tmp_path, monkeypatch):
         # Byte-pin: the memory/user blocks are EXACTLY what the native

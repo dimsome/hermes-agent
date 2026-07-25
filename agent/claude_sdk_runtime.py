@@ -93,8 +93,8 @@ def build_system_prompt_append(
     Hermes' own prompt composer is bypassed on this runtime; this is its
     replacement, built from the SAME native builders (W2 composer parity):
 
-      1. Operator persona/soul file (agent.claude_agent_sdk.append_file) —
-         identity lives here.
+      1. Hermes' active SOUL.md identity, or the built-in Hermes identity when
+         no SOUL exists. agent.claude_agent_sdk.append_file can override it.
       2. Session line — the native volatile-tier format (date-only for
          prefix-cache stability) + session id / model / provider.
       3. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
@@ -119,15 +119,23 @@ def build_system_prompt_append(
     from agent.transports.claude_agent_sdk_session import _provider_config
 
     soul_path = str(_provider_config().get("append_file") or "").strip()
+    identity: Optional[str] = None
     if soul_path:
-        soul = _read_capped(soul_path)
-        if soul:
-            blocks.append(soul)
-        else:
+        identity = _read_capped(soul_path)
+        if not identity:
             logger.warning(
                 "agent.claude_agent_sdk.append_file=%s is set but unreadable/empty",
                 soul_path,
             )
+    if not identity:
+        try:
+            from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, load_soul_md
+
+            identity = load_soul_md() or DEFAULT_AGENT_IDENTITY
+        except Exception:
+            logger.debug("native Hermes identity composition failed", exc_info=True)
+    if identity:
+        blocks.append(identity)
 
     # Session line — mirrors the native composer's volatile tier
     # (system_prompt.py): date-only so the append stays byte-stable all day.
@@ -701,6 +709,7 @@ def run_claude_agent_sdk_turn(
         # user turn (append_message has no dedup).
         "agent_persisted": True,
         "claude_sdk_session_id": turn.thread_id,
+        "claude_sdk_response_model": getattr(turn, "response_model", None),
         **usage_result,
     }
 
