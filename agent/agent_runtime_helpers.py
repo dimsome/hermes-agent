@@ -2191,6 +2191,31 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 exc_info=True,
             )
 
+    # Resuming an SDK conversation across an SDK <-> native/provider boundary
+    # would omit every intervening non-SDK turn. Clear only after the replacement
+    # runtime was built successfully. A model change within the SDK still resumes
+    # the same conversation, which the SDK supports with the new requested model.
+    from agent.claude_sdk_runtime import is_claude_agent_sdk_runtime
+
+    old_api_mode = _snapshot.get("api_mode")
+    if not isinstance(old_api_mode, str):
+        old_api_mode = None
+    crossed_sdk_boundary = is_claude_agent_sdk_runtime(
+        provider=old_provider,
+        api_mode=old_api_mode,
+    ) != is_claude_agent_sdk_runtime(
+        provider=agent.provider,
+        api_mode=getattr(agent, "api_mode", None),
+    )
+    if crossed_sdk_boundary and _session_db is not None and _session_id:
+        try:
+            _session_db.update_claude_sdk_session_id(_session_id, None)
+        except Exception:
+            logger.warning(
+                "Failed to clear Claude SDK continuity after provider boundary",
+                exc_info=True,
+            )
+
     # A live SDK session owns a CLI subprocess configured for the runtime that
     # created it. Retire it only after the replacement runtime is fully built,
     # keeping failed HTTP switches rollback-safe. The next SDK turn lazily

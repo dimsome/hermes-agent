@@ -926,9 +926,9 @@ def init_agent(
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
     elif agent.api_mode == "claude_agent_sdk":
         # claude-agent-sdk runtime — the official Agent SDK owns its own
-        # subprocess and subscription OAuth (CLAUDE_CODE_OAUTH_TOKEN /
-        # ~/.claude); there is no OpenAI-style client on this path, and no
-        # API key by design (#25267). Mirrors the bedrock_converse shape.
+        # subprocess and reads Claude-managed subscription login storage;
+        # there is no OpenAI-style client or environment credential route on
+        # this path (#25267). Mirrors the bedrock_converse shape.
         agent.client = None
         agent._client_kwargs = {}
         agent.api_key = api_key or "claude-subscription-oauth"

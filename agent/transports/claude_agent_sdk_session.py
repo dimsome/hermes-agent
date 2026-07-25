@@ -4,8 +4,8 @@ Owns one Claude Agent SDK client per Hermes session — the structural twin of
 ``codex_app_server_session.py``, with the Codex JSON-RPC subprocess replaced
 by Anthropic's official ``claude-agent-sdk`` (which manages the Claude Code
 CLI subprocess, its agent loop, and — critically — **subscription OAuth**:
-``CLAUDE_CODE_OAUTH_TOKEN`` / the ``~/.claude`` credential store, never a
-metered ``ANTHROPIC_API_KEY``). See GitHub issue #25267.
+Claude-managed login storage, never an environment credential or metered
+backend). See GitHub issue #25267.
 
 Lifecycle:
     session = ClaudeAgentSdkSession(cwd="/home/x/proj", model="claude-opus-4-8")
@@ -78,7 +78,6 @@ _AUTH_FAILURE_HINTS = (
     "token has expired",
     "expired token",
     "invalid bearer token",
-    "setup-token",
 )
 
 
@@ -97,9 +96,8 @@ def classify_auth_failure(*parts: str) -> Optional[str]:
                 original = original[:400] + "…"
             return (
                 "Claude authentication failed — the subscription OAuth token "
-                "looks expired or invalid. Refresh it with `claude setup-token` "
-                "(or `claude login` on this machine) and update "
-                "CLAUDE_CODE_OAUTH_TOKEN, then retry. "
+                "looks expired or invalid. Run `claude auth login` on this "
+                "machine to refresh Claude-managed login storage, then retry. "
                 f"(underlying error: {original})"
             )
     return None
@@ -145,6 +143,105 @@ _MCP_ENV_ALLOWLIST = (
     "HERMES_MCP_STATE_DB",  # the shims' documented state-DB override — a path, not a secret
     "HERMES_QUIET",
     "HERMES_REDACT_SECRETS",
+)
+
+
+# ClaudeAgentOptions.env is overlaid on the SDK subprocess's inherited
+# environment, not used as a replacement. Therefore every ambient key must be
+# present here: allowed runtime/config values keep their value, and everything
+# else gets an explicit empty-string override. In particular, do not preserve
+# proxies, SSH agents, cloud credentials, Hermes secrets, provider keys, or bot
+# tokens. The SDK adds its own CLAUDE_CODE_ENTRYPOINT/version markers later.
+_CLI_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "CLAUDE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        # Windows process/bootstrap paths.
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    }
+)
+
+
+def _build_sanitized_cli_env() -> dict[str, str]:
+    """Return the complete SDK env overlay with ambient secrets blanked."""
+    return {
+        key: value
+        if key in _CLI_ENV_ALLOWLIST or key.startswith("LC_")
+        else ""
+        for key, value in os.environ.items()
+    }
+
+
+# Any one of these non-empty variables can select or authenticate a metered
+# Claude backend. This runtime is subscription-only, so reject the route before
+# the SDK creates its inherited-environment CLI subprocess. The cloud-provider
+# credential names below are the documented Bedrock/Vertex credential paths in
+# addition to the explicit Claude Code selectors and endpoint overrides.
+_BILLING_ROUTE_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_MANTLE",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "CLOUD_ML_REGION",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
 )
 
 
@@ -269,17 +366,15 @@ class ClaudeAgentSdkSession:
         if self._client is not None:
             return self._session_id or "pending"
         # Hard rule, enforced fail-closed: this provider exists to bill the
-        # Claude SUBSCRIPTION. If a metered ANTHROPIC_API_KEY is present the
-        # underlying CLI would silently prefer it — refuse to start instead.
-        allow_metered = _provider_flag("allow_metered_key")
-        for metered_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-            if os.environ.get(metered_var) and not allow_metered:
+        # Claude subscription. Refuse every environment-selected credential or
+        # alternate backend before creating the inherited-environment CLI.
+        for route_var in _BILLING_ROUTE_ENV_VARS:
+            if os.environ.get(route_var):
                 raise RuntimeError(
-                    f"claude-agent-sdk runtime refuses to start: {metered_var} "
-                    "is set, which would silently switch billing from the "
-                    "Claude subscription to metered API usage. Unset it, or "
-                    "set agent.claude_agent_sdk.allow_metered_key: true in "
-                    "config.yaml to explicitly allow it."
+                    f"claude-agent-sdk runtime refuses to start: {route_var} "
+                    "is set, which can select credentials or a metered backend. "
+                    "Unset it; this runtime uses only Claude-managed subscription "
+                    "login storage."
                 )
         if self._client_factory is None:
             ok, msg = check_claude_sdk_available()
@@ -540,6 +635,7 @@ class ClaudeAgentSdkSession:
         fields = {
             "model": self._model,
             "cwd": self._cwd,
+            "env": _build_sanitized_cli_env(),
             "permission_mode": self._permission_mode,
             "system_prompt": system_prompt,
             "mcp_servers": mcp_servers,

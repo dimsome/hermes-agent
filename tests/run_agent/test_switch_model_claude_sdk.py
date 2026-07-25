@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -81,6 +81,8 @@ def test_codex_to_claude_sdk_is_clientless_with_empty_url():
     agent._create_openai_client = MagicMock(
         side_effect=AssertionError("OpenAI client must not be built")
     )
+    agent._session_db = MagicMock()
+    agent.session_id = "sess-boundary-in"
 
     with patch("agent.anthropic_adapter.build_anthropic_client") as build_anthropic:
         _switch(
@@ -101,6 +103,9 @@ def test_codex_to_claude_sdk_is_clientless_with_empty_url():
     assert agent.api_key == "claude-subscription-oauth"
     assert agent.client is None
     assert agent._client_kwargs == {}
+    agent._session_db.update_claude_sdk_session_id.assert_called_once_with(
+        "sess-boundary-in", None
+    )
 
 
 def test_switching_away_from_claude_sdk_retires_live_session():
@@ -114,6 +119,8 @@ def test_switching_away_from_claude_sdk_retires_live_session():
     )
     new_client = MagicMock(name="OpenRouterClient")
     agent._create_openai_client = MagicMock(return_value=new_client)
+    agent._session_db = MagicMock()
+    agent.session_id = "sess-boundary-out"
 
     _switch(
         agent,
@@ -127,6 +134,44 @@ def test_switching_away_from_claude_sdk_retires_live_session():
     sdk_session.close.assert_called_once_with()
     assert agent._claude_sdk_session is None
     assert agent.client is new_client
+    agent._session_db.update_claude_sdk_session_id.assert_called_once_with(
+        "sess-boundary-out", None
+    )
+
+
+def test_switch_away_and_back_clears_continuity_at_each_boundary():
+    agent = _make_agent(
+        provider="claude-agent-sdk",
+        model="claude-opus-5",
+        base_url="",
+        api_mode="claude_agent_sdk",
+        sdk_session=MagicMock(name="ClaudeSdkSession"),
+    )
+    agent._create_openai_client = MagicMock(return_value=MagicMock())
+    agent._session_db = MagicMock()
+    agent.session_id = "sess-round-trip"
+
+    _switch(
+        agent,
+        new_model="openai/gpt-5",
+        new_provider="openrouter",
+        api_key="new-key",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+    )
+    _switch(
+        agent,
+        new_model="claude-opus-5",
+        new_provider="claude-agent-sdk",
+        api_key="claude-subscription-oauth",
+        base_url="",
+        api_mode="claude_agent_sdk",
+    )
+
+    assert agent._session_db.update_claude_sdk_session_id.call_args_list == [
+        call("sess-round-trip", None),
+        call("sess-round-trip", None),
+    ]
 
 
 def test_claude_sdk_model_change_retires_session_for_lazy_resume(monkeypatch):
@@ -143,6 +188,8 @@ def test_claude_sdk_model_change_retires_session_for_lazy_resume(monkeypatch):
     agent._create_openai_client = MagicMock(
         side_effect=AssertionError("OpenAI client must not be built")
     )
+    agent._session_db = MagicMock()
+    agent.session_id = "sess-same-sdk"
 
     _switch(
         agent,
@@ -157,6 +204,7 @@ def test_claude_sdk_model_change_retires_session_for_lazy_resume(monkeypatch):
     assert agent._claude_sdk_session is None
     assert agent.model == "claude-opus-5"
     assert agent.api_mode == "claude_agent_sdk"
+    agent._session_db.update_claude_sdk_session_id.assert_not_called()
 
     captured = {}
 

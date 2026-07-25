@@ -20,11 +20,10 @@ class TestClaudeAgentSdkDefaults:
         assert "claude_agent_sdk" in agent
 
     def test_canonical_defaults(self):
-        # Upstream-conservative: no partial-message deltas, refuse to start
-        # over a metered key, no persona file appended.
+        # Subscription-only is invariant runtime behavior, not a configurable
+        # escape hatch. Only streaming and the persona append are configurable.
         assert DEFAULT_CONFIG["agent"]["claude_agent_sdk"] == {
             "streaming": False,
-            "allow_metered_key": False,
             "append_file": "",
         }
 
@@ -51,7 +50,6 @@ class TestUserConfigMerge:
         cfg = self._load(tmp_path, monkeypatch, {"agent": {"max_turns": 5}})
         assert cfg["agent"]["claude_agent_sdk"] == {
             "streaming": False,
-            "allow_metered_key": False,
             "append_file": "",
         }
         assert cfg["agent"]["max_turns"] == 5
@@ -63,5 +61,5 @@ class TestUserConfigMerge:
             {"agent": {"claude_agent_sdk": {"streaming": True}}},
         )
         assert cfg["agent"]["claude_agent_sdk"]["streaming"] is True
-        assert cfg["agent"]["claude_agent_sdk"]["allow_metered_key"] is False
+        assert "allow_metered_key" not in cfg["agent"]["claude_agent_sdk"]
         assert cfg["agent"]["claude_agent_sdk"]["append_file"] == ""

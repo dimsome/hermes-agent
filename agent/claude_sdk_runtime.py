@@ -19,6 +19,20 @@ from typing import Any, Dict, List, Optional, cast
 
 logger = logging.getLogger(__name__)
 
+_CLAUDE_AGENT_SDK_PROVIDERS = frozenset(
+    {"claude-agent-sdk", "claude-sdk", "claude-code-sdk", "claude_agent_sdk"}
+)
+
+
+def is_claude_agent_sdk_runtime(
+    *, provider: Optional[str] = None, api_mode: Optional[str] = None
+) -> bool:
+    """Whether a persisted/runtime route belongs to the Claude Agent SDK."""
+    return (api_mode or "").strip().lower() == "claude_agent_sdk" or (
+        provider or ""
+    ).strip().lower() in _CLAUDE_AGENT_SDK_PROVIDERS
+
+
 # Cap per persona/memory source so the append can't blow the context budget
 # (Hermes' native files are hard-capped anyway; the soul file is ours).
 _APPEND_SOURCE_MAX_CHARS = 8000
@@ -654,8 +668,17 @@ def run_claude_agent_sdk_turn(
                 pass
             agent._claude_sdk_session = None
 
-    if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+    projected_messages = turn.projected_messages
+    if turn.interrupted and projected_messages:
+        # An interrupt can land after an SDK ToolUseBlock but before its
+        # ToolResultBlock. Repair that partial projection with the shared replay
+        # policy before it reaches the caller or durable session history.
+        from agent.replay_cleanup import sanitize_replay_history
+
+        projected_messages = sanitize_replay_history(projected_messages)
+
+    if projected_messages:
+        messages.extend(projected_messages)
         # Early-return path bypasses conversation_loop's per-step persistence;
         # flush the new projected rows ourselves (idempotent via the intrinsic
         # _DB_PERSISTED_MARKER — the user turn was flushed at turn start).

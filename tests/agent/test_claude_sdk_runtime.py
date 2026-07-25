@@ -11,6 +11,7 @@ retire the client rather than silently continue.
 """
 
 from dataclasses import dataclass, field
+import os
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -27,15 +28,44 @@ from agent.transports.claude_sdk_event_projector import (
 )
 
 
+_CLAUDE_BILLING_ROUTE_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_MANTLE",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "CLOUD_ML_REGION",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_provider_config(monkeypatch):
-    """Every `agent.claude_agent_sdk` flag now resolves from config.yaml only.
+    """Keep SDK tests independent from the developer's real config.yaml.
 
-    Without this, `_provider_config()` reads the DEVELOPER'S REAL config.yaml:
-    a machine with `allow_metered_key: true` set would silently invert the
-    metered-billing refusal assertions, and a real `append_file` would leak into
-    the system-prompt tests. Default to an empty block; tests that care patch
-    `load_config_readonly` themselves (the last patch wins).
+    A real ``append_file`` would leak into the system-prompt tests. Default to an
+    empty block; tests that care patch ``load_config_readonly`` themselves (the
+    last patch wins).
     """
     import hermes_cli.config as cfg
 
@@ -224,7 +254,9 @@ class TestAuthClassifier:
     def test_auth_failure_produces_hint(self):
         hint = classify_auth_failure("HTTP 401 unauthorized: oauth token expired")
         assert hint is not None
-        assert "setup-token" in hint
+        assert "claude auth login" in hint
+        assert "Claude-managed" in hint
+        assert "HTTP 401 unauthorized" in hint
 
     def test_hint_preserves_underlying_error(self):
         # A hit RETIRES the session, so the true error must survive in the
@@ -355,7 +387,8 @@ class TestSession:
         finally:
             session.close()
         assert turn.should_retire
-        assert "setup-token" in (turn.error or "")
+        assert "claude auth login" in (turn.error or "")
+        assert "Claude-managed" in (turn.error or "")
 
     def test_connect_failure_fails_closed(self):
         session, _ = _make_session(connect_exc=RuntimeError("not logged in"))
@@ -393,14 +426,21 @@ class TestSession:
         fields = session.build_option_fields()
         assert "ANTHROPIC_API_KEY" not in fields["mcp_servers"]["hermes-tools"]["env"]
 
-    def test_metered_key_refuses_startup_fail_closed(self, monkeypatch):
-        # The hard rule enforced at the front door: a present metered key
-        # must abort the REAL runtime startup path, never silently rebill.
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
-        session = ClaudeAgentSdkSession(cwd="/tmp")  # no factory → real path
+    @pytest.mark.parametrize("route_env", _CLAUDE_BILLING_ROUTE_ENV_VARS)
+    def test_documented_billing_route_refuses_startup_fail_closed(
+        self, monkeypatch, route_env
+    ):
+        # Subscription-only means every documented credential, endpoint, and
+        # alternate-cloud selector aborts before the SDK client is built.
+        for name in _CLAUDE_BILLING_ROUTE_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(route_env, "SDK_BILLING_ROUTE_SENTINEL")
+        session, holder = _make_session(script=[ResultMessage(result="unused")])
         turn = session.run_turn("hi")
         assert turn.should_retire
-        assert "ANTHROPIC_API_KEY" in (turn.error or "")
+        assert route_env in (turn.error or "")
+        assert "SDK_BILLING_ROUTE_SENTINEL" not in (turn.error or "")
+        assert holder == {}
 
 
 # ---------- runtime glue ----------
@@ -491,6 +531,53 @@ class TestRuntimeGlue:
         assert agent._claude_sdk_session is None
         assert result["partial"] is True
 
+    def test_interrupted_side_effecting_tool_tail_is_repaired_before_flush(self):
+        agent = _make_agent()
+        agent._session_db = MagicMock()
+        agent._flush_messages_to_session_db = MagicMock()
+        dangling_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu-interrupted-bash",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": '{"command": "touch /tmp/maybe-ran"}',
+                    },
+                }
+            ],
+        }
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            interrupted=True,
+            projected_messages=[dangling_call],
+            final_text="",
+        )
+        messages = [{"role": "user", "content": "run it"}]
+
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="run it",
+            original_user_message="run it",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        projected = result["messages"][1:]
+        assert [message["role"] for message in projected] == ["assistant", "tool"]
+        assert projected[1]["tool_call_id"] == "toolu-interrupted-bash"
+        assert projected[1]["effect_disposition"] == "unknown"
+        answered_ids = {
+            message.get("tool_call_id")
+            for message in projected
+            if message.get("role") == "tool"
+        }
+        assert answered_ids == {"toolu-interrupted-bash"}
+        flushed_messages = agent._flush_messages_to_session_db.call_args.args[0]
+        assert flushed_messages == result["messages"]
+        assert flushed_messages[-1]["effect_disposition"] == "unknown"
+
 
 # ---------- background review must not spawn on this runtime ----------
 
@@ -535,6 +622,46 @@ class TestBackgroundReviewSuppressed:
 
 
 class TestMcpEnvMinimal:
+    def test_main_cli_env_overrides_every_non_allowlisted_parent_value(
+        self, monkeypatch
+    ):
+        sentinel = "SDK_PARENT_ENV_SENTINEL"
+        blocked = (
+            "SDK_UNKNOWN_SECRET",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+            "HTTPS_PROXY",
+            "SSH_AUTH_SOCK",
+            "TELEGRAM_BOT_TOKEN",
+            "HERMES_HOME",
+        )
+        for name in blocked:
+            monkeypatch.setenv(name, sentinel)
+        allowed = {
+            "HOME": "/tmp/sdk-home",
+            "PATH": "/usr/local/bin:/usr/bin",
+            "SHELL": "/bin/sh",
+            "LANG": "C.UTF-8",
+            "LC_TEST": "C.UTF-8",
+            "TERM": "xterm-256color",
+            "TMPDIR": "/tmp/sdk-tmp",
+            "CLAUDE_CONFIG_DIR": "/tmp/sdk-claude-config",
+            "SSL_CERT_FILE": "/tmp/sdk-ca.pem",
+        }
+        for name, value in allowed.items():
+            monkeypatch.setenv(name, value)
+
+        option_env = ClaudeAgentSdkSession(
+            cwd="/tmp", include_hermes_tools=False
+        ).build_option_fields()["env"]
+
+        assert set(os.environ) <= set(option_env)
+        assert all(option_env[name] == "" for name in blocked)
+        assert sentinel not in option_env.values()
+        assert {name: option_env[name] for name in allowed} == allowed
+
     def test_mcp_env_carries_no_secrets(self, monkeypatch):
         # Validator C4 (HIGH): the SDK inlines the MCP config -- env
         # included -- into the claude CLI argv, world-readable via ps. The
@@ -545,14 +672,10 @@ class TestMcpEnvMinimal:
         # guard would refuse startup before the MCP config is even built,
         # which is its own test below. The allowlist excludes it regardless.)
         monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-test-home")
-        session, holder = _make_session(
-            script=[ResultMessage(result="ok")], hermes_session_id="sess-9"
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", hermes_session_id="sess-9"
         )
-        try:
-            session.run_turn("ping")
-        finally:
-            session.close()
-        env = holder["client"].options["mcp_servers"]["hermes-tools"]["env"]
+        env = session.build_option_fields()["mcp_servers"]["hermes-tools"]["env"]
         for secret in ("CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY",
                        "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
             assert secret not in env, f"{secret} leaked into the MCP argv env"
@@ -584,10 +707,9 @@ class TestMcpEnvMinimal:
         assert turn.should_retire
         assert "ANTHROPIC_AUTH_TOKEN" in (turn.error or "")
 
-    def test_allow_metered_key_via_config_yaml(self, monkeypatch):
-        # The explicit override is a config.yaml key (AGENTS.md: behavioral
-        # settings live in config, not env); the guard steps aside and the
-        # fake-backed session starts normally.
+    def test_legacy_allow_metered_key_config_cannot_bypass_guard(self, monkeypatch):
+        # Old configs may still contain the removed key. It must be ignored:
+        # this runtime has no metered escape hatch.
         import hermes_cli.config as cfg
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
@@ -603,8 +725,8 @@ class TestMcpEnvMinimal:
             turn = session.run_turn("ping")
         finally:
             session.close()
-        assert not turn.should_retire
-        assert turn.error is None
+        assert turn.should_retire
+        assert "ANTHROPIC_API_KEY" in (turn.error or "")
 
     def test_half_connected_client_is_reaped_on_close(self):
         # Validator C6: on a connect failure the client was assigned only
@@ -1283,6 +1405,7 @@ class TestProviderWiring:
         assert profile is not None
         assert profile.api_mode == "claude_agent_sdk"
         assert profile.auth_type == "oauth_external"
+        assert profile.env_vars == ()
         assert get_provider_profile("claude-sdk") is profile
         # The anthropic profile keeps its own alias namespace untouched.
         anthropic = get_provider_profile("claude")

@@ -11,6 +11,7 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -245,8 +246,11 @@ async def test_model_session_sdk_writes_clientless_override_without_credentials(
     runner_any.session_store = backing_store
     async_store = AsyncMock()
     async_store._store = backing_store
+    async_store.get_or_create_session.return_value = SimpleNamespace(
+        session_id="sess-gateway-sdk-in", was_auto_reset=False
+    )
     runner_any._async_session_store = async_store
-    runner._session_db = None
+    runner._session_db = AsyncMock()
     monkeypatch.setattr(runner, "_evict_cached_agent", lambda _key: None)
 
     result = await runner._handle_model_command(
@@ -270,3 +274,54 @@ async def test_model_session_sdk_writes_clientless_override_without_credentials(
         "provider": "claude-agent-sdk",
         "base_url": "",
     }
+    runner._session_db.update_claude_sdk_session_id.assert_awaited_once_with(
+        "sess-gateway-sdk-in", None
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_switch_rehydrates_restart_override_before_sdk_boundary_clear(
+    tmp_path, monkeypatch
+):
+    """A cache-miss after gateway restart still sees the persisted SDK route.
+
+    The live agent is gone and the global config points elsewhere, so the
+    persisted session override is the only evidence that crossing back to a
+    native provider must invalidate Claude SDK continuity.
+    """
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "global-model", "provider": "openrouter"},
+    )
+    runner = _make_runner()
+    backing_store = object()
+    runner_any: Any = runner
+    runner_any.session_store = backing_store
+    async_store = AsyncMock()
+    async_store._store = backing_store
+    async_store.get_or_create_session.return_value = SimpleNamespace(
+        session_id="sess-gateway-sdk-out", was_auto_reset=False
+    )
+    runner_any._async_session_store = async_store
+    runner._session_db = AsyncMock()
+    monkeypatch.setattr(runner, "_evict_cached_agent", lambda _key: None)
+
+    def _rehydrate(session_key):
+        runner._session_model_overrides[session_key] = {
+            "model": "claude-opus-5",
+            "provider": "claude-agent-sdk",
+            "base_url": "",
+            "api_mode": "claude_agent_sdk",
+        }
+
+    monkeypatch.setattr(runner, "_rehydrate_session_model_override", _rehydrate)
+
+    result = await runner._handle_model_command(
+        _make_event("/model gpt-5.5 --provider openrouter --session")
+    )
+
+    assert result is not None and "gpt-5.5" in result
+    runner._session_db.update_claude_sdk_session_id.assert_awaited_once_with(
+        "sess-gateway-sdk-out", None
+    )
