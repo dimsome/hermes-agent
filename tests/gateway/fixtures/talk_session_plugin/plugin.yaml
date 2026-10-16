@@ -1,0 +1,3 @@
+name: talk-session-fixture
+version: '0.1.0'
+description: Offline consumer contract for native session attachment tests.
