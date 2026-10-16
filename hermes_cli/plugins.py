@@ -644,30 +644,15 @@ class PluginContext:
     @_serialized_replacement
     def register_command(
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None,
+        argument_mode: str | None = None, *, invocation_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
-        field; without it the command registers parameterless there but still accepts trailing text."""
-        clean = name.lower().strip().lstrip("/").replace(" ", "-")
-        if not clean:
-            logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
-            return
-        with suppress(Exception):  # reject if it conflicts with a built-in command
-            from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
-                logger.warning("Plugin '%s' tried to register command '/%s' which conflicts "
-                               "with a built-in command. Skipping.", self.manifest.name, clean)
-                return
-        hint = (args_hint or "").strip()
-        entry = {
-            "handler": handler, "description": description or "Plugin command",
-            "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
-            "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
-            else ("text" if hint else None),
-        }
-        return self._register_entry("command", clean, self._manager._plugin_commands, entry,
-                                    "Plugin %s registered command: /%s", clean)
+        field; without it the command registers parameterless there but still accepts trailing text.
+        ``invocation_context=True`` adds an ephemeral host-issued ``invocation`` keyword to the
+        handler (None outside gateway dispatch), for capturing an existing session attachment."""
+        from hermes_cli.plugins_commands import register_command
+        return register_command(self, name, handler, description, args_hint, argument_mode, invocation_context)
 
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
         """Dispatch a tool call through the registry with the parent agent (when available)

@@ -333,13 +333,13 @@ class SessionAuthority:
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity)
 
-    async def admit_native(self, event):
+    async def admit_native(self, event, *, _expected_ref=None, _authorize_write=None):
         """Await current connector policy, then commit before ACK or scheduling execution."""
         from gateway.session_ingress_media import capture_lease
         with capture_lease():  # captured bytes are held from capture until commit or refusal
-            return await self._admit_native(event)
+            return await self._admit_native(event, _expected_ref=_expected_ref, _authorize_write=_authorize_write)
 
-    async def _admit_native(self, event):
+    async def _admit_native(self, event, *, _expected_ref=None, _authorize_write=None):
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
@@ -347,13 +347,21 @@ class SessionAuthority:
         self._require_admission_open()
         source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
         from gateway.session_runtime_workers import tracked_write
-        ref = self._publish_route(source, *await tracked_write(self, partial(self._reserve_route, source)))
+        if _expected_ref is None:
+            ref = self._publish_route(source, *await tracked_write(self, partial(self._reserve_route, source)))
+        else:
+            # A command-issued attachment continues its exact owner. Never reserve a new session
+            # when reset/expiry/rerouting won the race with transcript capture.
+            ref = _expected_ref
+            live = self.sessions.get(ref.session_id)
+            if ref.profile_id != self.profile_id or live is None or live.route != payload['native_text_v1']['route']:
+                raise RuntimeStoreError('stale_attachment')
         identity = json.dumps([source.profile, source.platform.value, source.chat_id,
                                source.thread_id, source.user_id], separators=(',', ':'))
         request_id = str(payload['native_text_v1']['event']['message_id'] or uuid.uuid4().hex)
         return await tracked_write(self, partial(
             self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
-            request_id=request_id, payload=payload, authorize=self._admission_gate()),
+            request_id=request_id, payload=payload, authorize=self._admission_gate(_authorize_write)),
             then=partial(self._admitted, ref, event), ordered=True,
             after=partial(self._schedule_admitted, ref))
 
