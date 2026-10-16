@@ -252,7 +252,8 @@ class GatewayInboundHooksMixin:
                     _plugin_context = build_session_context(source, self.config)
                     _plugin_context.session_key = self._session_key_for_source(source)
                     user_args = event.get_command_args().strip()
-                    with self._session_env_scope(_plugin_context):
+                    from gateway.plugin_invocation import command_invocation
+                    with self._session_env_scope(_plugin_context), command_invocation(self, event):
                         if asyncio.iscoroutinefunction(plugin_handler):
                             result = await plugin_handler(user_args)
                         else:
