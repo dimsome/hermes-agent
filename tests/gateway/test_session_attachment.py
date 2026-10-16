@@ -47,10 +47,10 @@ async def setup_bridge(tmp_path, monkeypatch):
     runner._running = True
     adapter = OfflineDiscord()
     runner.adapters = {Platform.DISCORD: adapter}
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='offline-host')
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='room', chat_type='group', user_id='operator', guild_id='guild')
     runner._canonicalize(source)
-    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='offline-host')
     ref = authority.register(source)
     manager = PluginManager()
     ctx = PluginContext(PluginManifest(name='talk-contract', key='talk-contract', source='user'), manager)

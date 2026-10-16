@@ -13,6 +13,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.session_authorities import authority_for_home
 from gateway.session_contract import Principal, SessionRef
 from gateway.session_identity import clear_identity, identity_of, replace_source
+from gateway.session_ingress_context import native_callback
 from hermes_constants import hermes_home_key
 from hermes_state_runtime import RuntimeStoreError, _epoch
 
@@ -28,8 +29,8 @@ class AttachmentScope:
     operator_user_id: str
 
 
-def _native_identity(source):
-    return (source.platform.value, source.chat_id, source.thread_id, source.guild_id, source.user_id)
+def _native_route(source):
+    return (source.platform.value, source.chat_id, source.thread_id, source.guild_id)
 
 
 class SessionAttachment:
@@ -46,6 +47,7 @@ class SessionAttachment:
         self._identity = identity_of(source)
         if self._identity is None or self._identity.adapter() is None or not source.user_id:
             raise RuntimeStoreError('native_source_required')
+        self._transport_profile = runner._owning_profile(self._identity.adapter(), source.platform)[1]
         home = self._identity.runtime_home
         self._authority = authority_for_home(runner, home)
         if self._authority is None or hermes_home_key(ctx._manager.home_path) != hermes_home_key(home):
@@ -58,7 +60,7 @@ class SessionAttachment:
         self._live = self._authority.sessions.get(self._ref.session_id)
         self._epoch = self._authority.epoch
         self._closed = False
-        self.scope = AttachmentScope(self._authority.profile_id, self._ref.session_id, *_native_identity(source))
+        self.scope = AttachmentScope(self._authority.profile_id, self._ref.session_id, *_native_route(source), source.user_id)
         principal = json.dumps([source.profile, source.platform.value, source.chat_id,
                                 source.thread_id, source.user_id], separators=(',', ':'))
         self._actor = Principal('messaging:' + principal, self._ref.profile_id,
@@ -90,7 +92,8 @@ class SessionAttachment:
             if (entry is None or entry.suspended or self._live is None
                     or owner.sessions.get(self._ref.session_id) is not self._live
                     or self._live.route != self._route
-                    or _native_identity(self._live.source) != _native_identity(self._source)
+                    or _native_route(self._live.source) != _native_route(self._source)
+                    or runner._session_key_for_source(self._live.source) != self._route
                     or runner._session_key_for_source(source) != self._route
                     or entry.session_id != owner.physical_target(self._ref)):
                 raise RuntimeStoreError('stale_attachment')
@@ -118,8 +121,11 @@ class SessionAttachment:
             if event.is_command():
                 raise RuntimeStoreError('invalid_params')
             event.allow_gateway_control = False
-            return await self._authority.admit_native(event, _expected_ref=self._ref,
-                _authorize_write=lambda conn: self._check(scope, conn))
+            # The private callback binds this exact new event to the retained receiving bot,
+            # not the routed runtime's home or any caller-supplied provenance.
+            with native_callback(self._runner, event, self._identity.authorization_home, self._transport_profile):
+                return await self._authority.admit_native(event, _expected_ref=self._ref,
+                    _authorize_write=lambda conn: self._check(scope, conn))
 
     async def snapshot(self, scope):
         """Read the canonical host history without taking a viewer slot or execution lease."""
